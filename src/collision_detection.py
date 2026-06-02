@@ -3,21 +3,21 @@ AIS Collision Detection Pipeline
 =================================
 Assignment 4 — Big Data Processing with PySpark
 
-Builds directly on Assignment 3 (MongoDB sharded cluster + noise filtering)
-and the Shadow Fleet Detection project (parallel chunk I/O, teleportation
-detection, Haversine spatial filtering).
+Directly extends the Shadow Fleet Detection project:
+  - Same MMSI validation logic   (parsing.py → is_valid_mmsi)
+  - Same coordinate validation   (geo.py     → is_valid_coordinate)
+  - Same Haversine formula       (geo.py     → haversine_distance, returns km)
+  - Same teleportation detection (detect.py  → detect_teleportation_anomalies)
+  - Same 5-category noise taxonomy (parsing.py module docstring)
+  - Same timestamp format        "%d/%m/%Y %H:%M:%S"
+
+New in this assignment:
+  - PySpark for distributed processing (replaces parallel file-chunk architecture)
+  - Spatial-temporal bucketing for efficient collision pair detection
+  - Trajectory visualisation (±10 min window around collision)
 
 Area of interest : 50 nm radius of (55.225 N, 14.245 E) — Baltic Sea, south of Bornholm
 Time window      : December 1–31, 2021
-
-Pipeline stages:
-  1. Load all 31 daily AIS CSV files via Spark
-  2. Noise filtering (6 categories — same taxonomy as Assignment 3)
-  3. Teleportation / GPS-spike removal (from Shadow Fleet work)
-  4. Stationary vessel exclusion
-  5. Spatial-temporal bucketing → candidate pair generation (avoids O(n²))
-  6. Exact Haversine distance on candidates → collision identification
-  7. Trajectory extraction (±10 min) + map visualisation
 """
 
 import os
@@ -27,11 +27,11 @@ from datetime import datetime, timedelta
 
 from pyspark.sql import SparkSession, Window
 from pyspark.sql import functions as F
-from pyspark.sql.types import DoubleType, LongType, IntegerType, StringType
+from pyspark.sql.types import DoubleType, LongType, IntegerType, StringType, BooleanType
 
 import pandas as pd
 import matplotlib
-matplotlib.use("Agg")           # headless — no display inside Docker
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import contextily as ctx
@@ -44,256 +44,288 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # CONFIGURATION
-# All thresholds are defined here and referenced by name throughout the code
-# so the examiner can see at a glance what every magic number means.
-# ──────────────────────────────────────────────────────────────────────────────
+# Mirrors config.py from the Shadow Fleet project.
+# Only collision-specific parameters are new.
+# ─────────────────────────────────────────────────────────────────────────────
 
-# Geographic area of interest
-CENTER_LAT   = 55.225000
-CENTER_LON   = 14.245000
-RADIUS_NM    = 50.0            # nautical miles
-RADIUS_M     = RADIUS_NM * 1852.0   # metres (1 nm = 1852 m)
+# --- Copied directly from config.py (Shadow Fleet) ---
+INVALID_MMSI_PATTERNS = {
+    '000000000', '111111111', '222222222', '333333333', '444444444',
+    '555555555', '666666666', '777777777', '123456789', '999999999',
+    '012345678', '987654321', '000000001', '888888888',
+}
+INVALID_MMSI_PREFIXES  = ('0000', '1111', '9999')
+BASE_STATION_PREFIXES  = ('992',)
+EXPECTED_MMSI_LENGTH   = 9
 
-# Spatial bucketing grid for the candidate join (degrees).
-# 0.05° lat ≈ 5.5 km, 0.05° lon ≈ 3.1 km at 55°N — well above the
-# collision threshold, so no true collision can straddle a bucket boundary
-# without at least one ping appearing in the correct shared cell.
-GRID_SIZE    = 0.05            # degrees
+# Anomaly D threshold from config.py — reused here for GPS spike removal
+TELEPORTATION_SPEED_KNOTS     = 60.0
+TELEPORTATION_MIN_DISTANCE_KM = 10.0   # filters GPS jitter (same as Shadow Fleet)
 
-# Vessel motion thresholds
-MIN_SOG_KTS  = 0.5             # below this → vessel is considered stationary
-MAX_SOG_KTS  = 50.0            # above this → GPS spike / data error (teleportation)
+# Stationary vessel threshold — vessel is considered moving above this SOG
+MIN_SOG_KNOTS = 0.5   # same as Shadow Fleet loitering SOG lower bound
 
-# Collision proximity threshold.
-# The IMO defines a "near-miss" at < 0.5 nm (926 m).  We use 500 m as a
-# conservative collision threshold — vessels at this distance have almost
-# certainly made physical contact or had a serious collision.
-COLLISION_M  = 500.0           # metres
+# --- Column indices from config.py ---
+COL_TIMESTAMP      = 0
+COL_TYPE_OF_MOBILE = 1
+COL_MMSI           = 2
+COL_LATITUDE       = 3
+COL_LONGITUDE      = 4
+COL_NAV_STATUS     = 5
+COL_SOG            = 7
+COL_NAME           = 12
 
-# Trajectory visualisation window
-TRAJ_WINDOW  = 10              # minutes either side of collision
+# --- Area of interest (new for this assignment) ---
+CENTER_LAT  = 55.225000
+CENTER_LON  = 14.245000
+RADIUS_NM   = 50.0
+RADIUS_KM   = RADIUS_NM * 1.852        # 1 nm = 1.852 km
 
-# Runtime paths (overrideable via environment variables)
+# --- Spatial bucketing grid size (new for this assignment) ---
+# 0.05° ≈ 3–5 km at 55°N — well above the collision threshold
+# so no true collision can straddle a bucket without sharing at least one cell
+GRID_SIZE = 0.05   # degrees
+
+# --- Collision threshold (new for this assignment) ---
+# IMO defines near-miss at < 0.5 nm (926 m). We use 500 m as collision threshold.
+COLLISION_KM = 0.5   # km  (same unit as haversine_distance in geo.py)
+
+# --- Trajectory window (new for this assignment) ---
+TRAJ_WINDOW_MIN = 10   # minutes either side of collision
+
+# --- Runtime paths ---
 DATA_DIR   = os.getenv("DATA_DIR",   "/app/data")
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", "/app/output")
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# PURE-PYTHON HELPERS  (used both as standalone functions and as Spark UDFs)
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# GEO UTILITIES
+# Ported directly from geo.py (Shadow Fleet project).
+# haversine_distance returns KM — kept identical to avoid introducing
+# unit inconsistencies with the previous codebase.
+# ─────────────────────────────────────────────────────────────────────────────
 
-def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+def haversine_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     """
-    Great-circle distance in metres between two WGS-84 points.
-    Same formula used in the Shadow Fleet assignment for teleportation detection.
+    Great-circle distance in KILOMETRES between two WGS-84 points.
+    Identical to geo.py from the Shadow Fleet project.
     """
-    R = 6_371_000.0
-    phi1 = math.radians(lat1)
-    phi2 = math.radians(lat2)
-    d_phi    = math.radians(lat2 - lat1)
-    d_lambda = math.radians(lon2 - lon1)
-    a = (math.sin(d_phi / 2) ** 2
-         + math.cos(phi1) * math.cos(phi2) * math.sin(d_lambda / 2) ** 2)
-    return 2.0 * R * math.asin(math.sqrt(a))
+    R = 6371.0
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = (math.sin(dlat / 2) ** 2
+         + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2))
+         * math.sin(dlon / 2) ** 2)
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
-def _dist_to_centre(lat: float, lon: float) -> float:
-    """Haversine distance from a point to the area-of-interest centre."""
-    return haversine_m(lat, lon, CENTER_LAT, CENTER_LON)
+def is_valid_coordinate(lat: float, lon: float) -> bool:
+    """
+    Validate latitude and longitude values.
+    Ported from geo.py (Shadow Fleet project) — same rules.
+    """
+    if not (-90 <= lat <= 90):
+        return False
+    if not (-180 <= lon <= 180):
+        return False
+    if lat == 0.0 and lon == 0.0:   # Null Island — AIS default when GPS not locked
+        return False
+    return True
 
 
-# Register as Spark UDFs once the session exists (done inside build_spark)
-_haversine_udf      = None   # haversine_m(lat1, lon1, lat2, lon2) → metres
-_dist_centre_udf    = None   # _dist_to_centre(lat, lon)          → metres
+def dist_to_centre(lat: float, lon: float) -> float:
+    """Distance in km from a point to the area-of-interest centre."""
+    return haversine_distance(lat, lon, CENTER_LAT, CENTER_LON)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 1. SPARK SESSION
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# MMSI VALIDATION
+# Ported directly from parsing.py → is_valid_mmsi (Shadow Fleet project).
+# ─────────────────────────────────────────────────────────────────────────────
+
+def is_valid_mmsi(mmsi: str) -> bool:
+    """
+    Validate MMSI against all known dirty-data patterns.
+    Identical logic to parsing.py from the Shadow Fleet project.
+    """
+    mmsi = mmsi.strip() if mmsi else ""
+
+    if not mmsi or not mmsi.isdigit():
+        return False
+    if len(mmsi) != EXPECTED_MMSI_LENGTH:
+        return False
+    if mmsi in INVALID_MMSI_PATTERNS:
+        return False
+    if mmsi.startswith(INVALID_MMSI_PREFIXES):
+        return False
+    if mmsi.startswith(BASE_STATION_PREFIXES):   # shore infrastructure
+        return False
+    if len(set(mmsi)) == 1:                      # all-same-digit
+        return False
+    return True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SPARK SESSION
+# ─────────────────────────────────────────────────────────────────────────────
+
+# UDF references — registered after session creation
+_haversine_udf    = None
+_dist_centre_udf  = None
+_valid_mmsi_udf   = None
+_valid_coord_udf  = None
+
 
 def build_spark() -> SparkSession:
-    """
-    Create a local Spark session tuned for a single-node Docker container.
-    shuffle.partitions=200 balances parallelism vs overhead for ~10–50 M rows.
-    """
-    global _haversine_udf, _dist_centre_udf
+    global _haversine_udf, _dist_centre_udf, _valid_mmsi_udf, _valid_coord_udf
 
     spark = (
         SparkSession.builder
         .appName("AIS-Collision-Detection")
-        .config("spark.driver.memory",             "4g")
-        .config("spark.sql.shuffle.partitions",    "200")
+        .config("spark.driver.memory",                  "4g")
+        .config("spark.sql.shuffle.partitions",         "200")
         .config("spark.sql.autoBroadcastJoinThreshold", "50mb")
         .getOrCreate()
     )
     spark.sparkContext.setLogLevel("WARN")
 
-    # Register UDFs after session creation
-    _haversine_udf   = F.udf(haversine_m,       DoubleType())
-    _dist_centre_udf = F.udf(_dist_to_centre,   DoubleType())
+    _haversine_udf   = F.udf(haversine_distance, DoubleType())
+    _dist_centre_udf = F.udf(dist_to_centre,     DoubleType())
+    _valid_mmsi_udf  = F.udf(is_valid_mmsi,      BooleanType())
+    _valid_coord_udf = F.udf(is_valid_coordinate, BooleanType())
 
-    log.info("Spark session ready  (version %s)", spark.version)
+    log.info("Spark session ready (version %s)", spark.version)
     return spark
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 2. DATA LOADING
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE 1 — DATA LOADING
+# ─────────────────────────────────────────────────────────────────────────────
 
 def load_raw(spark: SparkSession):
     """
-    Load all CSV files matching data/*.csv in a single Spark read.
+    Load all 31 daily CSV files in one Spark read.
 
-    Schema note: we do NOT use inferSchema=true.  inferSchema triggers a full
-    extra scan of every file — expensive for 31 daily files.  Instead we read
-    everything as strings and cast manually (same approach as Assignment 3's
-    streaming CSV parser).
-
-    Danish AIS columns (from web.ais.dk):
-        Timestamp, Type of mobile, MMSI, Latitude, Longitude,
-        Navigational status, ROT, SOG, COG, Heading,
-        IMO, Callsign, Name, Ship type, Cargo type,
-        Width, Length, Type of position fixing device,
-        Draught, Destination, ETA, Data source type, A, B, C, D
+    inferSchema=false avoids a costly double-scan of all files.
+    All columns are read as strings and cast manually — same philosophy
+    as the Shadow Fleet's stream_valid_rows() which reads raw CSV fields
+    as strings before validating and converting them.
     """
     path = os.path.join(DATA_DIR, "*.csv")
-    log.info("Loading AIS data from  %s", path)
+    log.info("Loading AIS data from %s", path)
 
     df = (
         spark.read
         .option("header",      "true")
-        .option("inferSchema", "false")   # manual casting — see above
-        .option("mode",        "PERMISSIVE")  # bad rows → null, not exception
+        .option("inferSchema", "false")
+        .option("mode",        "PERMISSIVE")
         .csv(path)
     )
 
-    # Normalise column names: strip whitespace, lowercase, spaces → underscores
+    # Normalise column names
     for col in df.columns:
-        clean_name = col.strip().lower().replace(" ", "_")
-        if clean_name != col:
-            df = df.withColumnRenamed(col, clean_name)
+        clean = col.strip().lower().replace(" ", "_")
+        if clean != col:
+            df = df.withColumnRenamed(col, clean)
 
-    raw_count = df.count()
-    log.info("Raw rows loaded: {:,}".format(raw_count))
+    log.info("Raw rows loaded: {:,}".format(df.count()))
     return df
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 3. NOISE FILTERING  (6 categories from Assignment 3, extended)
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE 2 — NOISE FILTERING
+# Same 5-category taxonomy as parsing.py (Shadow Fleet project).
+# Category 6 (geographic/temporal bounds) is new for this assignment.
+# ─────────────────────────────────────────────────────────────────────────────
 
 def filter_noise(df):
     """
-    Apply the same 6-category noise taxonomy from Assignment 3, adapted for
-    collision detection.
+    Apply noise filtering using the same category taxonomy as parsing.py.
 
-    CATEGORY 1 — Invalid / null essential fields
-        Drop any row missing MMSI, lat, lon, timestamp, or SOG.
-        These cannot be spatially or temporally placed.
+    CATEGORY 1 — Invalid MMSI numbers
+        Same patterns as INVALID_MMSI_PATTERNS / INVALID_MMSI_PREFIXES in config.py.
+        Also excludes AIS base stations (992 prefix) per BASE_STATION_PREFIXES.
 
-    CATEGORY 2 — Invalid MMSI patterns
-        MMSI must be a 9-digit number in [100_000_000, 999_999_999].
-        Exclude known base-station prefixes (992xxxxxx used in Denmark).
-        Exclude all-same-digit patterns (000000000, 111111111, …).
+    CATEGORY 2 — Invalid coordinates
+        Same rules as geo.py → is_valid_coordinate():
+        lat ∈ [−90,90], lon ∈ [−180,180], (0.0,0.0) excluded.
 
-    CATEGORY 3 — Invalid coordinates
-        Lat must be in [−90, 90], lon in [−180, 180].
-        (0.0, 0.0) is "Null Island" — a well-known AIS default/error value.
+    CATEGORY 3 — Malformed rows
+        Rows with null essential fields after casting (truncated lines,
+        encoding errors, unparseable timestamps).
 
     CATEGORY 4 — Non-vessel transponders
-        Type of mobile: exclude base stations, AtoN, SART devices.
-        Navigational status: exclude "Not defined" combined with zero SOG
-        (often base station ghost records).
+        Type of mobile: base stations, AtoN excluded.
+        Navigational status: "At anchor", "Moored" excluded (not moving vessels).
 
-    CATEGORY 5 — Stationary vessels
-        SOG < MIN_SOG_KTS → vessel is at anchor, moored, or drifting.
-        Navigational status "At anchor" or "Moored" → explicit exclusion.
-        We are looking for moving vessels only.
+    CATEGORY 5 — Missing/default sensor values
+        SOG null → treated as 0.0 (stationary), then filtered by MIN_SOG_KNOTS.
+        Vessels with SOG < 0.5 kts are excluded (same lower bound as Shadow Fleet
+        loitering detection).
 
-    CATEGORY 6 — Out of area / out of time
-        Temporal: restrict to December 2021.
-        Spatial: bounding box first (cheap), then exact Haversine (expensive).
+    CATEGORY 6 — Out of area / out of time window  [new for this assignment]
+        Temporal: December 2021 only.
+        Spatial: bounding box first (cheap), then exact Haversine ≤ 50 nm.
     """
 
-    # ── CATEGORY 1: Drop rows with null essential fields ──────────────────────
-    df = df.withColumn("lat", F.col("latitude").cast(DoubleType()))
-    df = df.withColumn("lon", F.col("longitude").cast(DoubleType()))
-    df = df.withColumn("sog", F.col("sog").cast(DoubleType()))
-    df = df.withColumn("mmsi_long", F.col("mmsi").cast(LongType()))
-    df = df.withColumn(
-        "ts",
-        F.to_timestamp(F.col("timestamp"), "dd/MM/yyyy HH:mm:ss")
+    # Cast numeric fields
+    df = (
+        df
+        .withColumn("lat",  F.col("latitude").cast(DoubleType()))
+        .withColumn("lon",  F.col("longitude").cast(DoubleType()))
+        .withColumn("sog",  F.coalesce(F.col("sog").cast(DoubleType()), F.lit(0.0)))
+        .withColumn("ts",   F.to_timestamp(F.col("timestamp"), "dd/MM/yyyy HH:mm:ss"))
     )
-    before = df.count()
-    df = df.dropna(subset=["mmsi_long", "lat", "lon", "ts", "sog"])
-    log.info("CAT-1 null fields removed: {:,} rows dropped"
-             .format(before - df.count()))
 
-    # ── CATEGORY 2: Invalid MMSI patterns ─────────────────────────────────────
+    # CATEGORY 3 — Drop rows where essential fields are null after casting
     before = df.count()
-    df = df.filter(
-        (F.col("mmsi_long") >= 100_000_000) &   # 9-digit minimum
-        (F.col("mmsi_long") <= 999_999_999) &   # 9-digit maximum
-        # Exclude Danish base-station MMSI prefix 992xxxxxx
-        (~F.col("mmsi_long").between(992_000_000, 992_999_999)) &
-        # Exclude repeated-digit patterns (000…, 111…, … 999…)
-        (~F.col("mmsi").rlike(r"^(\d)\1{8}$"))
-    )
-    log.info("CAT-2 invalid MMSI removed: {:,} rows dropped"
-             .format(before - df.count()))
+    df = df.dropna(subset=["lat", "lon", "ts"])
+    df = df.filter(F.col("mmsi").isNotNull())
+    log.info("CAT-3 malformed rows removed: {:,}".format(before - df.count()))
 
-    # ── CATEGORY 3: Invalid / sentinel coordinates ────────────────────────────
+    # CATEGORY 1 — Invalid MMSI (uses same logic as parsing.py → is_valid_mmsi)
     before = df.count()
-    df = df.filter(
-        (F.col("lat").between(-90.0, 90.0)) &
-        (F.col("lon").between(-180.0, 180.0)) &
-        # Exclude Null Island (0.0, 0.0) and immediate vicinity
-        ~((F.abs(F.col("lat")) < 0.001) & (F.abs(F.col("lon")) < 0.001))
-    )
-    log.info("CAT-3 invalid coordinates removed: {:,} rows dropped"
-             .format(before - df.count()))
+    df = df.filter(_valid_mmsi_udf(F.col("mmsi")))
+    log.info("CAT-1 invalid MMSI removed: {:,}".format(before - df.count()))
 
-    # ── CATEGORY 4: Non-vessel transponders ───────────────────────────────────
+    # CATEGORY 2 — Invalid coordinates (same as geo.py → is_valid_coordinate)
     before = df.count()
-    exclude_mobile = ["base_station", "aton", "aid_to_navigation",
-                      "base station", "aid to navigation"]
+    df = df.filter(_valid_coord_udf(F.col("lat"), F.col("lon")))
+    log.info("CAT-2 invalid coordinates removed: {:,}".format(before - df.count()))
+
+    # CATEGORY 4 — Non-vessel transponders
+    before = df.count()
     if "type_of_mobile" in df.columns:
         df = df.filter(
-            ~F.lower(F.col("type_of_mobile")).isin(exclude_mobile)
+            ~F.lower(F.col("type_of_mobile")).isin(
+                "base_station", "base station", "aton", "aid_to_navigation"
+            )
         )
-    if "navigational_status" in df.columns:
-        df = df.filter(
-            ~F.col("navigational_status").isin(
-                "Not defined"  # combined with SOG check below
-            ) | (F.col("sog") > 0.0)
-        )
-    log.info("CAT-4 non-vessel transponders removed: {:,} rows dropped"
-             .format(before - df.count()))
-
-    # ── CATEGORY 5: Stationary vessels ────────────────────────────────────────
-    before = df.count()
-    df = df.filter(F.col("sog") >= MIN_SOG_KTS)
     if "navigational_status" in df.columns:
         df = df.filter(
             ~F.col("navigational_status").isin("At anchor", "Moored")
         )
-    log.info("CAT-5 stationary vessels removed: {:,} rows dropped"
-             .format(before - df.count()))
+    log.info("CAT-4 non-vessel transponders removed: {:,}".format(before - df.count()))
 
-    # ── CATEGORY 6: Temporal + geographic bounds ──────────────────────────────
+    # CATEGORY 5 — Stationary vessels (SOG below moving threshold)
+    before = df.count()
+    df = df.filter(F.col("sog") >= MIN_SOG_KNOTS)
+    log.info("CAT-5 stationary vessels removed: {:,}".format(before - df.count()))
+
+    # CATEGORY 6 — Temporal + geographic filter
     before = df.count()
 
-    # Time filter (exact)
+    # Time window: December 2021
     df = df.filter(
         (F.col("ts") >= F.lit("2021-12-01").cast("timestamp")) &
         (F.col("ts") <  F.lit("2022-01-01").cast("timestamp"))
     )
 
-    # Bounding-box pre-filter (cheap arithmetic — eliminates ~90 % of globe)
-    lat_margin = RADIUS_NM / 60.0                      # 1 nm ≈ 1/60 degree lat
-    lon_margin = RADIUS_NM / (60.0 * math.cos(math.radians(CENTER_LAT)))
+    # Bounding box pre-filter (cheap arithmetic — eliminates ~90% of globe)
+    lat_margin = RADIUS_KM / 111.0          # 1 degree lat ≈ 111 km
+    lon_margin = RADIUS_KM / (111.0 * math.cos(math.radians(CENTER_LAT)))
     df = df.filter(
         F.col("lat").between(CENTER_LAT - lat_margin * 1.1,
                              CENTER_LAT + lat_margin * 1.1) &
@@ -301,49 +333,46 @@ def filter_noise(df):
                              CENTER_LON + lon_margin * 1.1)
     )
 
-    # Exact Haversine radius filter (UDF applied only to bbox survivors)
-    df = df.withColumn("dist_centre_m", _dist_centre_udf("lat", "lon"))
-    df = df.filter(F.col("dist_centre_m") <= RADIUS_M)
+    # Exact Haversine radius (UDF applied only to bbox survivors)
+    df = df.withColumn("dist_centre_km", _dist_centre_udf("lat", "lon"))
+    df = df.filter(F.col("dist_centre_km") <= RADIUS_KM)
 
-    log.info("CAT-6 out-of-area/time removed: {:,} rows dropped"
-             .format(before - df.count()))
+    log.info("CAT-6 out-of-area/time removed: {:,}".format(before - df.count()))
 
-    # ── Materialise only the columns needed downstream ─────────────────────────
-    keep = ["mmsi_long", "ts", "lat", "lon", "sog"]
+    # Keep only columns needed downstream
+    keep = ["mmsi", "ts", "lat", "lon", "sog"]
     if "name" in df.columns:
         keep.append("name")
 
-    df = df.select(
-        F.col("mmsi_long").alias("mmsi"), *[F.col(c) for c in keep[1:]]
-    )
+    df = df.select([F.col(c) for c in keep])
 
     log.info("After all noise filters: {:,} rows remain".format(df.count()))
     return df
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 4. TELEPORTATION / GPS-SPIKE REMOVAL
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE 3 — TELEPORTATION / GPS SPIKE REMOVAL
+# Same logic as detect.py → detect_teleportation_anomalies (Shadow Fleet).
+# Ported to Spark window functions for distributed execution.
+# ─────────────────────────────────────────────────────────────────────────────
 
 def remove_teleportation(df):
     """
-    Detect and drop GPS anomaly spikes using the same 'teleportation' logic
-    from the Shadow Fleet detection project.
+    Remove GPS anomaly spikes using the same teleportation detection logic
+    as detect.py → detect_teleportation_anomalies() in the Shadow Fleet project.
 
-    Method:
-      - Per vessel, order pings by timestamp (window function).
-      - Compute implied speed = Haversine(prev_pos, curr_pos) / elapsed_seconds.
-      - If implied speed > MAX_SOG_KTS (50 kts) → the ping is a GPS spike.
+    Thresholds (from config.py):
+      TELEPORTATION_SPEED_KNOTS     = 60.0
+      TELEPORTATION_MIN_DISTANCE_KM = 10.0  (filters GPS jitter)
 
-    A single-point spike (one bad reading surrounded by good ones) is removed
-    in one pass.  Multi-point drift would require iterative passes but is rare
-    in practice — one pass is sufficient per the Assignment 3 findings.
+    A ping is dropped if BOTH conditions hold vs the previous ping:
+      - implied speed > 60 knots
+      - distance > 10 km  (avoids dropping legitimate slow vessels with
+                            long time gaps between pings)
 
-    Why 50 knots?
-      The fastest conventional surface vessels top out at ~35 kts.  50 kts gives
-      a generous buffer for legitimate high-speed craft (patrol boats, ferries)
-      while still catching the typical AIS teleportation error where a vessel
-      appears to jump 100+ km in a single report interval.
+    Implemented as a Spark window function (partitioned by MMSI, ordered by
+    timestamp) instead of the Shadow Fleet's per-MMSI list iteration — same
+    logic, distributed execution.
     """
     w = Window.partitionBy("mmsi").orderBy("ts")
 
@@ -355,7 +384,7 @@ def remove_teleportation(df):
     )
 
     df = df.withColumn(
-        "step_dist_m",
+        "step_km",
         F.when(
             F.col("prev_lat").isNotNull(),
             _haversine_udf("prev_lat", "prev_lon", "lat", "lon")
@@ -367,68 +396,57 @@ def remove_teleportation(df):
         F.when(
             F.col("prev_ts").isNotNull(),
             F.col("ts").cast(LongType()) - F.col("prev_ts")
-        ).otherwise(F.lit(1))  # default 1 s avoids div-by-zero for first ping
+        ).otherwise(F.lit(1))
     )
 
-    # Implied speed in knots  (1 knot = 0.5144 m/s)
+    # Implied speed in knots (1 knot = 1.852 km/h)
     df = df.withColumn(
-        "implied_kts",
+        "implied_knots",
         F.when(
             F.col("step_secs") > 0,
-            (F.col("step_dist_m") / F.col("step_secs")) / 0.5144
+            (F.col("step_km") / (F.col("step_secs") / 3600.0)) / 1.852
         ).otherwise(F.lit(0.0))
     )
 
     before = df.count()
-    df = df.filter(F.col("implied_kts") <= MAX_SOG_KTS)
-    log.info("Teleportation spikes removed: {:,} rows dropped"
-             .format(before - df.count()))
+    # Drop only if BOTH speed > threshold AND distance > jitter threshold
+    # (mirrors the TELEPORTATION_MIN_DISTANCE_KM filter in Shadow Fleet)
+    df = df.filter(
+        ~(
+            (F.col("implied_knots") > TELEPORTATION_SPEED_KNOTS) &
+            (F.col("step_km")       > TELEPORTATION_MIN_DISTANCE_KM)
+        )
+    )
+    log.info("Teleportation spikes removed: {:,}".format(before - df.count()))
 
     df = df.drop("prev_lat", "prev_lon", "prev_ts",
-                 "step_dist_m", "step_secs", "implied_kts")
+                 "step_km", "step_secs", "implied_knots")
     return df
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 5. SPATIAL-TEMPORAL BUCKETING  (efficient candidate generation)
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE 4 — SPATIAL-TEMPORAL BUCKETING (efficient candidate generation)
+# ─────────────────────────────────────────────────────────────────────────────
 
 def generate_candidates(df):
     """
-    Generate candidate collision pairs WITHOUT a full Cartesian product.
+    Generate collision candidate pairs WITHOUT a full Cartesian product.
 
-    The naive approach — join every ping against every other ping — is O(n²)
-    and completely impractical for millions of records.  We use the same
-    bucketing strategy proven effective in the Shadow Fleet project:
+    The Shadow Fleet project avoided Cartesian products by partitioning data
+    by MMSI before pairwise analysis. Here we extend that to 2D space:
 
-    APPROACH
-    ────────
-    1.  Assign each ping a TIME BUCKET:
-            minute_bucket = floor(unix_timestamp / 60)
-        Two pings in the same minute bucket are temporally co-located.
+    1. TIME BUCKET   — floor(unix_ts / 60) → 1-minute windows
+    2. SPATIAL BUCKET — floor(lon / 0.05), floor(lat / 0.05) → ~3–5 km cells
+    3. SELF-JOIN on (minute_bucket, grid_x, grid_y) with mmsi_a < mmsi_b
+       → only vessels sharing the same minute AND cell are compared
+    4. NEIGHBOUR EXPANSION — also test A's 8 adjacent cells (3×3 kernel)
+       → ensures no pair straddling a cell boundary is missed
+    5. EXACT HAVERSINE on surviving candidates only
 
-    2.  Assign each ping a SPATIAL BUCKET (grid cell):
-            grid_x = floor(lon / GRID_SIZE)
-            grid_y = floor(lat / GRID_SIZE)
-        GRID_SIZE = 0.05° ≈ 3–5 km — much larger than the 500 m collision
-        threshold, guaranteeing that colliding vessels share a bucket.
-
-    3.  SELF-JOIN on (minute_bucket, grid_x, grid_y) with mmsi_a < mmsi_b.
-        This reduces the join space from O(n²) to O(n × k²) where k is the
-        mean number of vessels per bucket (typically < 3 in open water).
-
-    4.  Apply the exact Haversine UDF only to the surviving candidate pairs
-        (a tiny fraction of all pairs) to get precise distances.
-
-    5.  Keep only pairs with distance ≤ COLLISION_M (500 m).
-
-    BOUNDARY NOTE: a pair straddling a cell boundary could theoretically be
-    missed.  We address this by also expanding the join to adjacent cells
-    (grid_x ± 1, grid_y ± 1) using a cross-join on a small offset table,
-    ensuring complete coverage.
+    Complexity: O(n × k²) where k = mean vessels per bucket (~2–3 in open water)
+    vs O(n²) for a naive join.
     """
 
-    # ── Add bucket columns ────────────────────────────────────────────────────
     df = (
         df
         .withColumn("minute_bucket",
@@ -439,37 +457,35 @@ def generate_candidates(df):
                     F.floor(F.col("lat") / GRID_SIZE).cast(IntegerType()))
     )
 
-    # ── Build offset table for neighbour-cell expansion ───────────────────────
-    # We test the vessel's own cell + 8 neighbours (3×3 kernel).
-    # Only cell A's own bucket is expanded; cell B keeps its natural bucket.
-    # This ensures every pair within GRID_SIZE of a boundary is captured.
+    # Neighbour cell offsets (3×3 kernel)
     offsets = [(dx, dy) for dx in (-1, 0, 1) for dy in (-1, 0, 1)]
-    offset_df = (
-        df.sparkSession
-        .createDataFrame(offsets, ["dx", "dy"])
+    offset_df = F.broadcast(
+        df.sparkSession.createDataFrame(offsets, ["dx", "dy"])
     )
 
-    # Expand A-side pings to include neighbour cells
-    a_expanded = (
+    # Expand A-side to include neighbour cells
+    a_exp = (
         df.alias("a")
-        .crossJoin(F.broadcast(offset_df))
-        .withColumn("adj_grid_x",
-                    (F.col("a.grid_x") + F.col("dx")).cast(IntegerType()))
-        .withColumn("adj_grid_y",
-                    (F.col("a.grid_y") + F.col("dy")).cast(IntegerType()))
+        .crossJoin(offset_df)
+        .withColumn("adj_x", (F.col("a.grid_x") + F.col("dx")).cast(IntegerType()))
+        .withColumn("adj_y", (F.col("a.grid_y") + F.col("dy")).cast(IntegerType()))
         .drop("dx", "dy")
     )
 
     b = df.alias("b")
 
-    # ── Join: same minute + same (possibly offset) cell + different MMSI ──────
+    name_col_a = (F.col("a.name").alias("name_a") if "name" in df.columns
+                  else F.lit(None).cast(StringType()).alias("name_a"))
+    name_col_b = (F.col("b.name").alias("name_b") if "name" in df.columns
+                  else F.lit(None).cast(StringType()).alias("name_b"))
+
     candidates = (
-        a_expanded.join(
+        a_exp.join(
             b,
             on=(
                 (F.col("a.minute_bucket") == F.col("b.minute_bucket")) &
-                (F.col("adj_grid_x")      == F.col("b.grid_x"))        &
-                (F.col("adj_grid_y")      == F.col("b.grid_y"))        &
+                (F.col("adj_x")           == F.col("b.grid_x"))        &
+                (F.col("adj_y")           == F.col("b.grid_y"))        &
                 (F.col("a.mmsi")          <  F.col("b.mmsi"))
             ),
             how="inner"
@@ -479,75 +495,67 @@ def generate_candidates(df):
             F.col("a.ts").alias("ts_a"),
             F.col("a.lat").alias("lat_a"),
             F.col("a.lon").alias("lon_a"),
-            F.col("a.name").alias("name_a") if "name" in df.columns
-                else F.lit(None).cast(StringType()).alias("name_a"),
+            name_col_a,
             F.col("b.mmsi").alias("mmsi_b"),
             F.col("b.ts").alias("ts_b"),
             F.col("b.lat").alias("lat_b"),
             F.col("b.lon").alias("lon_b"),
-            F.col("b.name").alias("name_b") if "name" in df.columns
-                else F.lit(None).cast(StringType()).alias("name_b"),
+            name_col_b,
         )
     )
 
-    # ── Exact Haversine distance on candidate pairs ───────────────────────────
+    # Exact Haversine distance (in km — consistent with geo.py)
     candidates = candidates.withColumn(
-        "dist_m",
+        "dist_km",
         _haversine_udf("lat_a", "lon_a", "lat_b", "lon_b")
     )
 
-    candidates = candidates.filter(F.col("dist_m") <= COLLISION_M)
+    candidates = candidates.filter(F.col("dist_km") <= COLLISION_KM)
 
     n = candidates.count()
-    log.info("Collision candidates (dist ≤ %.0f m): {:,} pairs".format(n),
-             COLLISION_M)
+    log.info("Collision candidates (dist ≤ %.3f km): {:,} pairs".format(n),
+             COLLISION_KM)
     return candidates
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 6. IDENTIFY THE COLLISION EVENT
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE 5 — IDENTIFY THE COLLISION EVENT
+# ─────────────────────────────────────────────────────────────────────────────
 
 def find_collision(candidates):
     """
-    Select the single closest-approach event from all candidates.
-
-    We take the minimum-distance record.  In real-world AIS data the actual
-    physical collision is the moment of closest approach — the point where
-    the two vessels' GPS positions are nearest to each other.
-
-    Returns a pandas Series (one row).
+    Select the closest-approach event — the moment of minimum distance
+    between any two vessels. This is the collision event.
     """
     row = (
         candidates
-        .orderBy(F.col("dist_m").asc())
+        .orderBy(F.col("dist_km").asc())
         .limit(1)
         .toPandas()
     )
 
     if row.empty:
         raise RuntimeError(
-            "No collision found within %.0f m.  "
-            "Consider increasing COLLISION_M or checking the data files." % COLLISION_M
+            "No collision found within %.3f km. "
+            "Try increasing COLLISION_KM or checking data files." % COLLISION_KM
         )
 
     return row.iloc[0]
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 7. EXTRACT TRAJECTORY WINDOW
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE 6 — TRAJECTORY EXTRACTION
+# ─────────────────────────────────────────────────────────────────────────────
 
 def extract_trajectories(df, event) -> pd.DataFrame:
     """
-    Pull all pings for both collision vessels within ±TRAJ_WINDOW minutes of
-    the collision timestamp.  Returns a pandas DataFrame for plotting.
+    Pull all pings for both vessels within ±TRAJ_WINDOW_MIN of the collision.
     """
     t0     = pd.Timestamp(event["ts_a"])
     mmsi_a = int(event["mmsi_a"])
     mmsi_b = int(event["mmsi_b"])
-    t_lo   = (t0 - timedelta(minutes=TRAJ_WINDOW)).to_pydatetime()
-    t_hi   = (t0 + timedelta(minutes=TRAJ_WINDOW)).to_pydatetime()
+    t_lo   = (t0 - timedelta(minutes=TRAJ_WINDOW_MIN)).to_pydatetime()
+    t_hi   = (t0 + timedelta(minutes=TRAJ_WINDOW_MIN)).to_pydatetime()
 
     traj = (
         df
@@ -559,22 +567,18 @@ def extract_trajectories(df, event) -> pd.DataFrame:
         .orderBy("mmsi", "ts")
         .toPandas()
     )
-    log.info("Trajectory pings extracted: %d  (both vessels, ±%d min)",
-             len(traj), TRAJ_WINDOW)
+    log.info("Trajectory pings: %d (both vessels, ±%d min)", len(traj), TRAJ_WINDOW_MIN)
     return traj
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 8. VISUALISATION
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE 7 — VISUALISATION
+# ─────────────────────────────────────────────────────────────────────────────
 
 def plot_trajectories(traj: pd.DataFrame, event) -> str:
     """
-    Plot both vessels' 20-minute trajectory window on a CartoDB Positron
-    basemap.  Saves to OUTPUT_DIR/trajectory_map.png.
-
-    Coordinate system: WGS-84 (EPSG:4326) reprojected to Web Mercator
-    (EPSG:3857) so contextily basemap tiles align correctly.
+    Plot both vessels' 20-minute trajectory window on a CartoDB basemap.
+    Saves to OUTPUT_DIR/trajectory_map.png.
     """
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -585,13 +589,12 @@ def plot_trajectories(traj: pd.DataFrame, event) -> str:
     c_lat  = float(event["lat_a"])
     c_lon  = float(event["lon_a"])
     c_time = event["ts_a"]
+    dist_m = float(event["dist_km"]) * 1000
 
     transformer = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
 
-    def to_mercator(sub_df):
-        xs, ys = transformer.transform(
-            sub_df["lon"].values, sub_df["lat"].values
-        )
+    def to_mercator(sub):
+        xs, ys = transformer.transform(sub["lon"].values, sub["lat"].values)
         return xs, ys
 
     df_a = traj[traj["mmsi"] == mmsi_a].sort_values("ts")
@@ -603,51 +606,42 @@ def plot_trajectories(traj: pd.DataFrame, event) -> str:
 
     fig, ax = plt.subplots(figsize=(13, 10))
 
-    # ── Track lines ───────────────────────────────────────────────────────────
-    COLOR_A, COLOR_B = "#1f77b4", "#ff7f0e"   # matplotlib default blue / orange
+    COLOR_A, COLOR_B = "#1f77b4", "#ff7f0e"
 
     ax.plot(xs_a, ys_a, "-o", color=COLOR_A, markersize=5, linewidth=2.0,
             label=f"Vessel A: {name_a}  (MMSI {mmsi_a})", zorder=3)
     ax.plot(xs_b, ys_b, "-o", color=COLOR_B, markersize=5, linewidth=2.0,
             label=f"Vessel B: {name_b}  (MMSI {mmsi_b})", zorder=3)
 
-    # ── Start / end markers ───────────────────────────────────────────────────
     for xs, ys, c in [(xs_a, ys_a, COLOR_A), (xs_b, ys_b, COLOR_B)]:
-        if len(xs) > 0:
-            ax.plot(xs[0],  ys[0],  "^", color=c, markersize=11,
-                    zorder=4, markeredgecolor="white", markeredgewidth=0.8)
-            ax.plot(xs[-1], ys[-1], "s", color=c, markersize=11,
-                    zorder=4, markeredgecolor="white", markeredgewidth=0.8)
+        if len(xs):
+            ax.plot(xs[0],  ys[0],  "^", color=c, markersize=11, zorder=4,
+                    markeredgecolor="white", markeredgewidth=0.8)
+            ax.plot(xs[-1], ys[-1], "s", color=c, markersize=11, zorder=4,
+                    markeredgecolor="white", markeredgewidth=0.8)
 
-    # ── Collision star ────────────────────────────────────────────────────────
     ax.plot(cx, cy, "*", color="#d62728", markersize=22, zorder=5,
-            label=f"Collision  ({float(event['dist_m']):.0f} m apart)")
+            label=f"Collision  ({dist_m:.0f} m apart)")
 
-    # ── Basemap ───────────────────────────────────────────────────────────────
     try:
         ctx.add_basemap(ax, crs="EPSG:3857",
                         source=ctx.providers.CartoDB.Positron, zoom=12)
     except Exception as exc:
         log.warning("Basemap tiles unavailable: %s", exc)
 
-    # ── Labels ────────────────────────────────────────────────────────────────
     ax.set_title(
         f"Vessel Collision Trajectory  —  {c_time}\n"
-        f"Position: {c_lat:.5f} °N,  {c_lon:.5f} °E   |   "
-        f"Window: ±{TRAJ_WINDOW} min",
+        f"Position: {c_lat:.5f}°N, {c_lon:.5f}°E   |   Window: ±{TRAJ_WINDOW_MIN} min",
         fontsize=13, fontweight="bold"
     )
     ax.set_xlabel("Easting (EPSG:3857)")
     ax.set_ylabel("Northing (EPSG:3857)")
 
-    legend_extra = [
-        mpatches.Patch(color="none", label="▲ track start   ■ track end")
-    ]
     handles, labels = ax.get_legend_handles_labels()
-    ax.legend(handles + legend_extra, labels + ["▲ track start   ■ track end"],
+    extra = [mpatches.Patch(color="none", label="▲ track start   ■ track end")]
+    ax.legend(handles + extra, labels + ["▲ track start   ■ track end"],
               loc="upper left", fontsize=9, framealpha=0.9)
 
-    # ── Save ──────────────────────────────────────────────────────────────────
     out = os.path.join(OUTPUT_DIR, "trajectory_map.png")
     plt.tight_layout()
     plt.savefig(out, dpi=150, bbox_inches="tight")
@@ -655,11 +649,12 @@ def plot_trajectories(traj: pd.DataFrame, event) -> str:
     return out
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 9. PRINT RESULTS
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE 8 — PRINT RESULTS
+# ─────────────────────────────────────────────────────────────────────────────
 
 def print_results(event) -> None:
+    dist_m = float(event["dist_km"]) * 1000
     sep = "=" * 62
     print("\n" + sep)
     print("   AIS COLLISION DETECTION — FINAL RESULT")
@@ -671,46 +666,30 @@ def print_results(event) -> None:
     print(f"   Collision Time    :  {event['ts_a']}")
     print(f"   Latitude          :  {float(event['lat_a']):.6f} °N")
     print(f"   Longitude         :  {float(event['lon_a']):.6f} °E")
-    print(f"   Closest Distance  :  {float(event['dist_m']):.1f} m")
+    print(f"   Closest Distance  :  {dist_m:.1f} m")
     print(sep + "\n")
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# MAIN ENTRY POINT
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────────────────────────────────────
 
 def main():
     spark = build_spark()
 
-    # Stage 1 — Load
-    raw = load_raw(spark)
-
-    # Stage 2 — 6-category noise filter (same taxonomy as Assignment 3)
-    cleaned = filter_noise(raw)
-
-    # Stage 3 — Teleportation / GPS spike removal (from Shadow Fleet project)
+    raw      = load_raw(spark)
+    cleaned  = filter_noise(raw)
     denoised = remove_teleportation(cleaned)
 
-    # Cache here: denoised is used twice — once for collision search,
-    # once for trajectory extraction.  Without caching Spark would recompute
-    # the entire pipeline a second time.
+    # Cache: reused for collision search + trajectory extraction
     denoised.cache()
-    denoised.count()   # materialise the cache now
+    denoised.count()
     log.info("Denoised dataset cached.")
 
-    # Stage 4 — Spatial-temporal bucketing → candidate pairs
-    candidates = generate_candidates(denoised)
-
-    # Stage 5 — Identify the collision event (closest pair)
-    event = find_collision(candidates)
-
-    # Stage 6 — Extract trajectory window
+    candidates   = generate_candidates(denoised)
+    event        = find_collision(candidates)
     trajectories = extract_trajectories(denoised, event)
-
-    # Stage 7 — Visualise
     plot_trajectories(trajectories, event)
-
-    # Stage 8 — Report
     print_results(event)
 
     spark.stop()
