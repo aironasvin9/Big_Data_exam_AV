@@ -1,0 +1,16 @@
+# Core big-data framework
+pyspark==3.5.1
+
+# Data manipulation (small-scale post-processing only)
+pandas==2.2.2
+
+# Geospatial
+pyproj==3.6.1
+contextily==1.6.0      # slippy-map basemap tiles for matplotlib
+
+# Visualisation
+matplotlib==3.9.0
+Pillow==10.3.0          # contextily dependency for image handling
+
+# HTTP (used by contextily tile fetcher & download script)
+requests==2.32.3

@@ -1,0 +1,33 @@
+version: "3.9"
+
+# ============================================================
+# AIS Collision Detection — Docker Compose
+# ============================================================
+# Volumes:
+#   ./data   → /app/data    (AIS CSV files, downloaded automatically)
+#   ./output → /app/output  (results: trajectory_map.png, etc.)
+#
+# Usage:
+#   docker compose up --build
+# ============================================================
+
+services:
+  ais-collision:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ais-collision-detection:latest
+    container_name: ais-collision-detection
+    environment:
+      - DATA_DIR=/app/data
+      - OUTPUT_DIR=/app/output
+      # Tune Spark memory to fit your host — adjust if needed
+      - SPARK_DRIVER_MEMORY=4g
+    volumes:
+      # Persist downloaded CSV files between runs
+      - ./data:/app/data
+      # Collect the output (trajectory_map.png + any logs)
+      - ./output:/app/output
+    # Give Spark enough shared memory for in-process shuffle
+    shm_size: "2gb"
+    # No ports needed — this is a batch job
