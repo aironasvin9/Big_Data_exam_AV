@@ -184,7 +184,7 @@ def build_spark() -> SparkSession:
     spark = (
         SparkSession.builder
         .appName("AIS-Collision-Detection")
-        .config("spark.driver.memory",                  "4g")
+        .config("spark.driver.memory",                  "8g")
         .config("spark.sql.shuffle.partitions",         "200")
         .config("spark.sql.autoBroadcastJoinThreshold", "50mb")
         .getOrCreate()
@@ -226,7 +226,7 @@ def load_raw(spark: SparkSession):
 
     # Normalise column names
     for col in df.columns:
-        clean = col.strip().lower().replace(" ", "_")
+        clean = col.strip().lower().replace(" ", "_").lstrip("#").strip("_")
         if clean != col:
             df = df.withColumnRenamed(col, clean)
 
@@ -285,14 +285,27 @@ def filter_noise(df):
     df = df.filter(F.col("mmsi").isNotNull())
     log.info("CAT-3 malformed rows removed: {:,}".format(before - df.count()))
 
-    # CATEGORY 1 — Invalid MMSI (uses same logic as parsing.py → is_valid_mmsi)
+    # CATEGORY 1 — Invalid MMSI (pure Spark SQL, mirrors parsing.py is_valid_mmsi)
+    invalid_patterns_list = list(INVALID_MMSI_PATTERNS)
     before = df.count()
-    df = df.filter(_valid_mmsi_udf(F.col("mmsi")))
+    df = df.filter(
+        F.col("mmsi").rlike(r"^\d{9}$") &
+        ~F.col("mmsi").isin(invalid_patterns_list) &
+        ~F.col("mmsi").startswith("992") &
+        ~F.col("mmsi").rlike(r"^0000") &
+        ~F.col("mmsi").rlike(r"^1111") &
+        ~F.col("mmsi").rlike(r"^9999") &
+        ~F.col("mmsi").rlike(r"^(\d)\1{8}$")
+    )
     log.info("CAT-1 invalid MMSI removed: {:,}".format(before - df.count()))
 
-    # CATEGORY 2 — Invalid coordinates (same as geo.py → is_valid_coordinate)
+    # CATEGORY 2 — Invalid coordinates (pure Spark SQL, mirrors geo.py is_valid_coordinate)
     before = df.count()
-    df = df.filter(_valid_coord_udf(F.col("lat"), F.col("lon")))
+    df = df.filter(
+        F.col("lat").between(-90.0, 90.0) &
+        F.col("lon").between(-180.0, 180.0) &
+        ~((F.abs(F.col("lat")) < 0.001) & (F.abs(F.col("lon")) < 0.001))
+    )
     log.info("CAT-2 invalid coordinates removed: {:,}".format(before - df.count()))
 
     # CATEGORY 4 — Non-vessel transponders
@@ -334,7 +347,13 @@ def filter_noise(df):
     )
 
     # Exact Haversine radius (UDF applied only to bbox survivors)
-    df = df.withColumn("dist_centre_km", _dist_centre_udf("lat", "lon"))
+    df = df.withColumn("dist_centre_km",
+        F.lit(6371.0) * F.lit(2.0) * F.asin(F.sqrt(
+            F.pow(F.sin((F.radians(F.col("lat")) - F.radians(F.lit(CENTER_LAT))) / 2), 2) +
+            F.cos(F.radians(F.lit(CENTER_LAT))) * F.cos(F.radians(F.col("lat"))) *
+            F.pow(F.sin((F.radians(F.col("lon")) - F.radians(F.lit(CENTER_LON))) / 2), 2)
+        ))
+    )
     df = df.filter(F.col("dist_centre_km") <= RADIUS_KM)
 
     log.info("CAT-6 out-of-area/time removed: {:,}".format(before - df.count()))
@@ -380,14 +399,18 @@ def remove_teleportation(df):
         df
         .withColumn("prev_lat", F.lag("lat").over(w))
         .withColumn("prev_lon", F.lag("lon").over(w))
-        .withColumn("prev_ts",  F.lag("ts").cast(LongType()).over(w))
+        .withColumn("prev_ts",  F.lag("ts").over(w).cast(LongType()))
     )
 
     df = df.withColumn(
         "step_km",
         F.when(
             F.col("prev_lat").isNotNull(),
-            _haversine_udf("prev_lat", "prev_lon", "lat", "lon")
+            F.lit(6371.0) * F.lit(2.0) * F.asin(F.sqrt(
+                F.pow(F.sin((F.radians(F.col("lat")) - F.radians(F.col("prev_lat"))) / 2), 2) +
+                F.cos(F.radians(F.col("prev_lat"))) * F.cos(F.radians(F.col("lat"))) *
+                F.pow(F.sin((F.radians(F.col("lon")) - F.radians(F.col("prev_lon"))) / 2), 2)
+            ))
         ).otherwise(F.lit(0.0))
     )
 
@@ -457,20 +480,7 @@ def generate_candidates(df):
                     F.floor(F.col("lat") / GRID_SIZE).cast(IntegerType()))
     )
 
-    # Neighbour cell offsets (3×3 kernel)
-    offsets = [(dx, dy) for dx in (-1, 0, 1) for dy in (-1, 0, 1)]
-    offset_df = F.broadcast(
-        df.sparkSession.createDataFrame(offsets, ["dx", "dy"])
-    )
-
-    # Expand A-side to include neighbour cells
-    a_exp = (
-        df.alias("a")
-        .crossJoin(offset_df)
-        .withColumn("adj_x", (F.col("a.grid_x") + F.col("dx")).cast(IntegerType()))
-        .withColumn("adj_y", (F.col("a.grid_y") + F.col("dy")).cast(IntegerType()))
-        .drop("dx", "dy")
-    )
+    a_exp = df.alias("a")
 
     b = df.alias("b")
 
@@ -484,8 +494,8 @@ def generate_candidates(df):
             b,
             on=(
                 (F.col("a.minute_bucket") == F.col("b.minute_bucket")) &
-                (F.col("adj_x")           == F.col("b.grid_x"))        &
-                (F.col("adj_y")           == F.col("b.grid_y"))        &
+                (F.col("a.grid_x")         == F.col("b.grid_x"))        &
+                (F.col("a.grid_y")         == F.col("b.grid_y"))        &
                 (F.col("a.mmsi")          <  F.col("b.mmsi"))
             ),
             how="inner"
@@ -507,7 +517,11 @@ def generate_candidates(df):
     # Exact Haversine distance (in km — consistent with geo.py)
     candidates = candidates.withColumn(
         "dist_km",
-        _haversine_udf("lat_a", "lon_a", "lat_b", "lon_b")
+        F.lit(6371.0) * F.lit(2.0) * F.asin(F.sqrt(
+            F.pow(F.sin((F.radians(F.col("lat_b")) - F.radians(F.col("lat_a"))) / 2), 2) +
+            F.cos(F.radians(F.col("lat_a"))) * F.cos(F.radians(F.col("lat_b"))) *
+            F.pow(F.sin((F.radians(F.col("lon_b")) - F.radians(F.col("lon_a"))) / 2), 2)
+        ))
     )
 
     candidates = candidates.filter(F.col("dist_km") <= COLLISION_KM)
