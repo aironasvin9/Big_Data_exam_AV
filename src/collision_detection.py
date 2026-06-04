@@ -95,12 +95,14 @@ COLLISION_KM = 0.5   # km  (same unit as haversine_distance in geo.py)
 # --- Trajectory window (new for this assignment) ---
 TRAJ_WINDOW_MIN = 10   # minutes either side of collision
 
-# --- Collision signature validation (new for tug-assist filtering) ---
+# --- Collision signature validation (improved for robustness) ---
 # Thresholds to distinguish true collisions from tug-assisted vessel formations
-APPROACH_THRESHOLD_KM = 1.0   # vessels must be > 1 km apart before collision
-DIVERGE_THRESHOLD_KM = 0.8    # vessels must separate > 0.8 km after collision
-MIN_APPROACH_DROP_KM = 0.3    # minimum distance reduction from pre to collision
-MIN_DIVERGE_RISE_KM = 0.3     # minimum distance increase from collision to post
+# These are now more adaptive — we check for approach/diverge patterns
+# rather than strict distance thresholds, to work in congested areas.
+APPROACH_THRESHOLD_KM = 0.5   # vessels should show meaningful approach (>0.5 km change)
+DIVERGE_THRESHOLD_KM = 0.3    # vessels should show meaningful diverge (>0.3 km change)
+MIN_PRE_DISTANCE_KM = 0.3     # if pre-distance < 0.3 km, likely already in formation
+TUG_FORMATION_MAX_DIST = 0.2  # if all three distances < 0.2 km, it's a formation
 
 # --- Runtime paths ---
 DATA_DIR   = os.getenv("DATA_DIR",   "/app/data")
@@ -549,47 +551,54 @@ def generate_candidates(df):
 
 def find_collision(candidates, denoised_df):
     """
-    Find the closest-approach event where both vessels were genuinely
-    far apart before the collision — ensuring visible diverging tracks.
+    Find the closest-approach event where both vessels demonstrate a clear
+    approach-collision-diverge signature.
     
     KEY INNOVATION: Distinguish between:
       - TRUE COLLISION: Two vessels approach → get very close → diverge
       - TUG ASSIST: Two vessels maintain constant formation distance for extended duration
     
     The collision signature is validated by comparing distances in three windows:
-      1. PRE-collision (10 min before)
+      1. PRE-collision (10 min window)
       2. Collision point (closest approach)
-      3. POST-collision (10 min after)
+      3. POST-collision (10 min window)
     
     For a true collision:
-      - pre_dist >> collision_dist (vessels approaching)
-      - collision_dist is minimum (closest point)
-      - post_dist >> collision_dist (vessels separating)
+      - Significant approach phase (pre_dist >> collision_dist)
+      - Clear minimum at collision point
+      - Significant divergence phase (post_dist >> collision_dist)
     
     For tug-assist formations:
-      - pre_dist ≈ collision_dist ≈ post_dist (constant distance maintained)
+      - All distances remain constant (constant formation)
+    
+    NEW: This version is more adaptive and provides detailed diagnostics for debugging.
     """
-    cands_pd = candidates.orderBy(F.col("dist_km").asc()).limit(200).toPandas()
+    cands_pd = candidates.orderBy(F.col("dist_km").asc()).limit(500).toPandas()
     if cands_pd.empty:
         raise RuntimeError("No collision candidates found.")
 
+    log.info("Analyzing top %d collision candidate pairs", len(cands_pd))
+    
     best = None
-    for _, row in cands_pd.iterrows():
+    candidates_evaluated = []
+    
+    for idx, row in cands_pd.iterrows():
         t0     = pd.Timestamp(row["ts_a"])
         mmsi_a = int(row["mmsi_a"])
         mmsi_b = int(row["mmsi_b"])
+        name_a = str(row.get("name_a") or f"MMSI {mmsi_a}")
+        name_b = str(row.get("name_b") or f"MMSI {mmsi_b}")
         
-        # EXPANDED TIME WINDOWS for better statistical analysis
-        # Pre-collision: 10 minutes before, averaging last 4 minutes of window
+        # EXPANDED TIME WINDOWS for statistical reliability
+        # Pre-collision: first 4 minutes of the 10-minute pre-window
         t_pre     = (t0 - timedelta(minutes=TRAJ_WINDOW_MIN)).to_pydatetime()
         t_pre_end = (t0 - timedelta(minutes=TRAJ_WINDOW_MIN - 4)).to_pydatetime()
         
-        # Post-collision: 1 minute after, averaging next 6 minutes after that
-        t_post    = (t0 + timedelta(minutes=1)).to_pydatetime()
-        t_post_end = (t0 + timedelta(minutes=TRAJ_WINDOW_MIN - 4)).to_pydatetime()
+        # Post-collision: last 6 minutes of the 10-minute post-window
+        t_post    = (t0 + timedelta(minutes=4)).to_pydatetime()
+        t_post_end = (t0 + timedelta(minutes=TRAJ_WINDOW_MIN)).to_pydatetime()
 
         # ── PRE-COLLISION WINDOW ──
-        # Average position of each vessel in the 4 minutes leading up to collision
         pre = (
             denoised_df
             .filter(F.col("mmsi").isin(mmsi_a, mmsi_b))
@@ -598,17 +607,30 @@ def find_collision(candidates, denoised_df):
                 (F.col("ts") <= F.lit(t_pre_end).cast("timestamp"))
             )
             .groupBy("mmsi")
-            .agg(F.avg("lat").alias("lat"), F.avg("lon").alias("lon"))
+            .agg(
+                F.avg("lat").alias("lat"), 
+                F.avg("lon").alias("lon"),
+                F.count("*").alias("count")
+            )
             .toPandas()
         )
 
         if len(pre) < 2:
+            log.debug("[%d] %s + %s: SKIPPED (insufficient pre-collision data)", 
+                     idx, name_a, name_b)
             continue
 
         pre_a = pre[pre["mmsi"] == mmsi_a]
         pre_b = pre[pre["mmsi"] == mmsi_b]
 
         if pre_a.empty or pre_b.empty:
+            log.debug("[%d] %s + %s: SKIPPED (missing pre-collision positions)", 
+                     idx, name_a, name_b)
+            continue
+
+        if pre_a.iloc[0]["count"] < 2 or pre_b.iloc[0]["count"] < 2:
+            log.debug("[%d] %s + %s: SKIPPED (sparse pre-collision data)", 
+                     idx, name_a, name_b)
             continue
 
         lat1, lon1 = pre_a.iloc[0]["lat"], pre_a.iloc[0]["lon"]
@@ -616,7 +638,6 @@ def find_collision(candidates, denoised_df):
         pre_dist_km = haversine_distance(lat1, lon1, lat2, lon2)
 
         # ── POST-COLLISION WINDOW ──
-        # Average position of each vessel in the minutes after collision
         post = (
             denoised_df
             .filter(F.col("mmsi").isin(mmsi_a, mmsi_b))
@@ -625,17 +646,30 @@ def find_collision(candidates, denoised_df):
                 (F.col("ts") <= F.lit(t_post_end).cast("timestamp"))
             )
             .groupBy("mmsi")
-            .agg(F.avg("lat").alias("lat"), F.avg("lon").alias("lon"))
+            .agg(
+                F.avg("lat").alias("lat"), 
+                F.avg("lon").alias("lon"),
+                F.count("*").alias("count")
+            )
             .toPandas()
         )
 
         if len(post) < 2:
+            log.debug("[%d] %s + %s: SKIPPED (insufficient post-collision data)", 
+                     idx, name_a, name_b)
             continue
 
         post_a = post[post["mmsi"] == mmsi_a]
         post_b = post[post["mmsi"] == mmsi_b]
 
         if post_a.empty or post_b.empty:
+            log.debug("[%d] %s + %s: SKIPPED (missing post-collision positions)", 
+                     idx, name_a, name_b)
+            continue
+
+        if post_a.iloc[0]["count"] < 2 or post_b.iloc[0]["count"] < 2:
+            log.debug("[%d] %s + %s: SKIPPED (sparse post-collision data)", 
+                     idx, name_a, name_b)
             continue
 
         lat1p, lon1p = post_a.iloc[0]["lat"], post_a.iloc[0]["lon"]
@@ -645,70 +679,92 @@ def find_collision(candidates, denoised_df):
         collision_dist_km = float(row["dist_km"])
         
         # ── COLLISION SIGNATURE VALIDATION ──
-        # Measure the "approach" and "diverge" components of the collision signature
-        pre_to_collision_drop = pre_dist_km - collision_dist_km
-        post_from_collision_rise = post_dist_km - collision_dist_km
+        approach_magnitude = pre_dist_km - collision_dist_km
+        diverge_magnitude = post_dist_km - collision_dist_km
         
-        # TRUE COLLISION signature:
-        # 1. Vessels were far apart before collision (> APPROACH_THRESHOLD_KM)
-        # 2. They got significantly closer (drop >= MIN_APPROACH_DROP_KM)
-        # 3. They separated afterwards (rise >= MIN_DIVERGE_RISE_KM AND post_dist >= DIVERGE_THRESHOLD_KM)
-        if (pre_dist_km > APPROACH_THRESHOLD_KM and 
-            pre_to_collision_drop >= MIN_APPROACH_DROP_KM and 
-            post_from_collision_rise >= MIN_DIVERGE_RISE_KM and
-            post_dist_km >= DIVERGE_THRESHOLD_KM):
-            
+        # Evaluate collision signature strength
+        is_strong_approach = approach_magnitude >= APPROACH_THRESHOLD_KM
+        is_strong_diverge = diverge_magnitude >= DIVERGE_THRESHOLD_KM
+        is_formation = (pre_dist_km < TUG_FORMATION_MAX_DIST and 
+                       collision_dist_km < TUG_FORMATION_MAX_DIST and 
+                       post_dist_km < TUG_FORMATION_MAX_DIST)
+        
+        evaluation = {
+            "idx": idx,
+            "mmsi_a": mmsi_a,
+            "mmsi_b": mmsi_b,
+            "name_a": name_a,
+            "name_b": name_b,
+            "pre_dist": pre_dist_km,
+            "collision_dist": collision_dist_km,
+            "post_dist": post_dist_km,
+            "approach_magnitude": approach_magnitude,
+            "diverge_magnitude": diverge_magnitude,
+            "is_strong_approach": is_strong_approach,
+            "is_strong_diverge": is_strong_diverge,
+            "is_formation": is_formation,
+            "row": row,
+        }
+        candidates_evaluated.append(evaluation)
+        
+        # TRUE COLLISION: strong approach AND strong diverge AND not a formation
+        if is_strong_approach and is_strong_diverge and not is_formation:
             best = row
             log.info(
-                "✓ TRUE COLLISION DETECTED: %s (MMSI %s) + %s (MMSI %s)\n"
-                "  ├─ Pre-distance:    %.3f km\n"
-                "  ├─ Collision dist:  %.3f km\n"
-                "  ├─ Post-distance:   %.3f km\n"
-                "  ├─ Approach drop:   %.3f km\n"
-                "  └─ Diverge rise:    %.3f km",
-                row.get("name_a", mmsi_a), mmsi_a,
-                row.get("name_b", mmsi_b), mmsi_b,
-                pre_dist_km, 
-                collision_dist_km, 
-                post_dist_km,
-                pre_to_collision_drop,
-                post_from_collision_rise
+                "✓ TRUE COLLISION (ID %d): %s (MMSI %s) ↔ %s (MMSI %s)\n"
+                "  ├─ Pre-distance:      %.3f km\n"
+                "  ├─ Collision dist:    %.3f km\n"
+                "  ├─ Post-distance:     %.3f km\n"
+                "  ├─ Approach magnitude: %.3f km ✓\n"
+                "  └─ Diverge magnitude: %.3f km ✓",
+                idx, name_a, mmsi_a, name_b, mmsi_b,
+                pre_dist_km, collision_dist_km, post_dist_km,
+                approach_magnitude, diverge_magnitude
             )
             break
-        elif (pre_dist_km < 0.3 and collision_dist_km < 0.3 and post_dist_km < 0.3):
-            # TUG-ASSIST or close formation pattern detected
-            log.debug(
-                "✗ TUG-ASSIST/FORMATION PATTERN (constant distance): %s (MMSI %s) + %s (MMSI %s)\n"
-                "  All distances < 0.3 km (pre: %.3f, collision: %.3f, post: %.3f)",
-                row.get("name_a", mmsi_a), mmsi_a,
-                row.get("name_b", mmsi_b), mmsi_b,
-                pre_dist_km, 
-                collision_dist_km, 
-                post_dist_km
-            )
-            continue
-        else:
-            # Partial signature match (not enough approach/diverge)
-            log.debug(
-                "✗ REJECTED (weak signature): %s (MMSI %s) + %s (MMSI %s)\n"
-                "  Pre: %.3f km, Collision: %.3f km, Post: %.3f km | "
-                "Drop: %.3f km (need ≥%.3f), Rise: %.3f km (need ≥%.3f)",
-                row.get("name_a", mmsi_a), mmsi_a,
-                row.get("name_b", mmsi_b), mmsi_b,
-                pre_dist_km,
-                collision_dist_km,
-                post_dist_km,
-                pre_to_collision_drop, MIN_APPROACH_DROP_KM,
-                post_from_collision_rise, MIN_DIVERGE_RISE_KM
-            )
-            continue
 
     if best is None:
-        log.warning(
-            "No true approach/diverge collision signature found. "
-            "Falling back to minimum distance (may be tug-assist or close encounter)."
-        )
-        best = cands_pd.iloc[0]
+        # Fallback logic: try to find best partial match
+        if candidates_evaluated:
+            # Score by strongest divergence (vessels actually separating)
+            best_eval = max(candidates_evaluated, 
+                           key=lambda e: e["diverge_magnitude"] if not e["is_formation"] else -1)
+            
+            if best_eval["diverge_magnitude"] > 0.1:
+                log.warning(
+                    "No perfect collision signature found. Using best partial match (ID %d):\n"
+                    "  %s (MMSI %s) + %s (MMSI %s)\n"
+                    "  Distances: %.3f → %.3f → %.3f km | Diverge: %.3f km",
+                    best_eval["idx"],
+                    best_eval["name_a"], best_eval["mmsi_a"],
+                    best_eval["name_b"], best_eval["mmsi_b"],
+                    best_eval["pre_dist"],
+                    best_eval["collision_dist"],
+                    best_eval["post_dist"],
+                    best_eval["diverge_magnitude"]
+                )
+                best = best_eval["row"]
+            else:
+                log.error(
+                    "No valid collision detected. All candidates show tug-assist or formation patterns."
+                )
+                log.info("Top 5 candidates (by closest distance):")
+                for i, cand in enumerate(candidates_evaluated[:5]):
+                    log.info(
+                        "  [%d] %s + %s: %.3f → %.3f → %.3f km "
+                        "(approach: %.3f, diverge: %.3f, formation: %s)",
+                        cand["idx"],
+                        cand["name_a"], cand["name_b"],
+                        cand["pre_dist"], cand["collision_dist"], cand["post_dist"],
+                        cand["approach_magnitude"], cand["diverge_magnitude"],
+                        cand["is_formation"]
+                    )
+                raise RuntimeError(
+                    "No valid collision detected after analyzing {:,} candidates. "
+                    "Results may only contain vessel formations or tugs.".format(len(cands_pd))
+                )
+        else:
+            raise RuntimeError("No collision candidates survived validation.")
 
     return best
 
