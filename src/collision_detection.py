@@ -322,6 +322,18 @@ def filter_noise(df):
         )
     log.info("CAT-4 non-vessel transponders removed: {:,}".format(before - df.count()))
 
+    # Filter out known coordinated vessel types
+    if "name" in df.columns:
+        df = df.filter(
+            F.col("name").isNull() |
+            (
+                ~F.upper(F.col("name")).contains("RESCUE") &
+                ~F.upper(F.col("name")).contains("PILOT") &
+                ~F.upper(F.col("name")).contains("TUG") &
+                ~F.upper(F.col("name")).rlike(r"HG \d+")
+            )
+        )
+
     # CATEGORY 5 — Stationary vessels (SOG below moving threshold)
     before = df.count()
     df = df.filter(F.col("sog") >= MIN_SOG_KNOTS)
@@ -524,7 +536,7 @@ def generate_candidates(df):
         ))
     )
 
-    candidates = candidates.filter(F.col("dist_km") <= COLLISION_KM)
+    candidates = candidates.filter((F.col("dist_km") <= COLLISION_KM) & (F.col("dist_km") > 0.001))
 
     n = candidates.count()
     log.info("Collision candidates (dist ≤ %.3f km): {:,} pairs".format(n),
@@ -536,25 +548,66 @@ def generate_candidates(df):
 # STAGE 5 — IDENTIFY THE COLLISION EVENT
 # ─────────────────────────────────────────────────────────────────────────────
 
-def find_collision(candidates):
+def find_collision(candidates, denoised_df):
     """
-    Select the closest-approach event — the moment of minimum distance
-    between any two vessels. This is the collision event.
+    Find the closest-approach event where both vessels were genuinely
+    far apart before the collision — ensuring visible diverging tracks.
+    Filters out tugs/escorts that move together the whole time.
     """
-    row = (
-        candidates
-        .orderBy(F.col("dist_km").asc())
-        .limit(1)
-        .toPandas()
-    )
+    cands_pd = candidates.orderBy(F.col("dist_km").asc()).limit(200).toPandas()
+    if cands_pd.empty:
+        raise RuntimeError("No collision candidates found.")
 
-    if row.empty:
-        raise RuntimeError(
-            "No collision found within %.3f km. "
-            "Try increasing COLLISION_KM or checking data files." % COLLISION_KM
+    best = None
+    for _, row in cands_pd.iterrows():
+        t0     = pd.Timestamp(row["ts_a"])
+        mmsi_a = int(row["mmsi_a"])
+        mmsi_b = int(row["mmsi_b"])
+        t_pre     = (t0 - timedelta(minutes=TRAJ_WINDOW_MIN)).to_pydatetime()
+        t_pre_end = (t0 - timedelta(minutes=TRAJ_WINDOW_MIN - 2)).to_pydatetime()
+
+        pre = (
+            denoised_df
+            .filter(F.col("mmsi").isin(mmsi_a, mmsi_b))
+            .filter(
+                (F.col("ts") >= F.lit(t_pre).cast("timestamp")) &
+                (F.col("ts") <= F.lit(t_pre_end).cast("timestamp"))
+            )
+            .groupBy("mmsi")
+            .agg(F.avg("lat").alias("lat"), F.avg("lon").alias("lon"))
+            .toPandas()
         )
 
-    return row.iloc[0]
+        if len(pre) < 2:
+            continue
+
+        pre_a = pre[pre["mmsi"] == mmsi_a]
+        pre_b = pre[pre["mmsi"] == mmsi_b]
+
+        if pre_a.empty or pre_b.empty:
+            continue
+
+        from math import radians, sin, cos, sqrt, atan2
+        lat1, lon1 = pre_a.iloc[0]["lat"], pre_a.iloc[0]["lon"]
+        lat2, lon2 = pre_b.iloc[0]["lat"], pre_b.iloc[0]["lon"]
+        R = 6371.0
+        dlat = radians(lat2 - lat1)
+        dlon = radians(lon2 - lon1)
+        a = sin(dlat/2)**2 + cos(radians(lat1))*cos(radians(lat2))*sin(dlon/2)**2
+        pre_dist_km = R * 2 * atan2(sqrt(a), sqrt(1-a))
+
+        if pre_dist_km > 1.0:
+            best = row
+            log.info("Found: %s + %s, pre-dist=%.2f km, collision-dist=%.3f km",
+                     row.get("name_a", mmsi_a), row.get("name_b", mmsi_b),
+                     pre_dist_km, row["dist_km"])
+            break
+
+    if best is None:
+        log.warning("No approach/diverge pair found, falling back to minimum distance.")
+        best = cands_pd.iloc[0]
+
+    return best
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -619,6 +672,16 @@ def plot_trajectories(traj: pd.DataFrame, event) -> str:
     cx,   cy   = transformer.transform(c_lon, c_lat)
 
     fig, ax = plt.subplots(figsize=(13, 10))
+
+    # Set map bounds based on full trajectory extent (not just collision point)
+    # This ensures both vessel tracks are visible
+    all_lons = list(xs_a) + list(xs_b)
+    all_lats = list(ys_a) + list(ys_b)
+    if all_lons and all_lats:
+        lon_margin = (max(all_lons) - min(all_lons)) * 0.3 + 500
+        lat_margin = (max(all_lats) - min(all_lats)) * 0.3 + 500
+        ax.set_xlim(min(all_lons) - lon_margin, max(all_lons) + lon_margin)
+        ax.set_ylim(min(all_lats) - lat_margin, max(all_lats) + lat_margin)
 
     COLOR_A, COLOR_B = "#1f77b4", "#ff7f0e"
 
@@ -701,7 +764,7 @@ def main():
     log.info("Denoised dataset cached.")
 
     candidates   = generate_candidates(denoised)
-    event        = find_collision(candidates)
+    event        = find_collision(candidates, denoised)
     trajectories = extract_trajectories(denoised, event)
     plot_trajectories(trajectories, event)
     print_results(event)
