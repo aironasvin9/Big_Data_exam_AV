@@ -44,11 +44,11 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────
 # CONFIGURATION
 # Mirrors config.py from the Shadow Fleet project.
 # Only collision-specific parameters are new.
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────
 
 # --- Copied directly from config.py (Shadow Fleet) ---
 INVALID_MMSI_PATTERNS = {
@@ -95,17 +95,24 @@ COLLISION_KM = 0.5   # km  (same unit as haversine_distance in geo.py)
 # --- Trajectory window (new for this assignment) ---
 TRAJ_WINDOW_MIN = 10   # minutes either side of collision
 
+# --- Collision signature validation (new for tug-assist filtering) ---
+# Thresholds to distinguish true collisions from tug-assisted vessel formations
+APPROACH_THRESHOLD_KM = 1.0   # vessels must be > 1 km apart before collision
+DIVERGE_THRESHOLD_KM = 0.8    # vessels must separate > 0.8 km after collision
+MIN_APPROACH_DROP_KM = 0.3    # minimum distance reduction from pre to collision
+MIN_DIVERGE_RISE_KM = 0.3     # minimum distance increase from collision to post
+
 # --- Runtime paths ---
 DATA_DIR   = os.getenv("DATA_DIR",   "/app/data")
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", "/app/output")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────
 # GEO UTILITIES
 # Ported directly from geo.py (Shadow Fleet project).
 # haversine_distance returns KM — kept identical to avoid introducing
 # unit inconsistencies with the previous codebase.
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────
 
 def haversine_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     """
@@ -140,10 +147,10 @@ def dist_to_centre(lat: float, lon: float) -> float:
     return haversine_distance(lat, lon, CENTER_LAT, CENTER_LON)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────
 # MMSI VALIDATION
 # Ported directly from parsing.py → is_valid_mmsi (Shadow Fleet project).
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────
 
 def is_valid_mmsi(mmsi: str) -> bool:
     """
@@ -167,9 +174,9 @@ def is_valid_mmsi(mmsi: str) -> bool:
     return True
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────
 # SPARK SESSION
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────
 
 # UDF references — registered after session creation
 _haversine_udf    = None
@@ -200,9 +207,9 @@ def build_spark() -> SparkSession:
     return spark
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────
 # STAGE 1 — DATA LOADING
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────
 
 def load_raw(spark: SparkSession):
     """
@@ -234,11 +241,11 @@ def load_raw(spark: SparkSession):
     return df
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────
 # STAGE 2 — NOISE FILTERING
 # Same 5-category taxonomy as parsing.py (Shadow Fleet project).
 # Category 6 (geographic/temporal bounds) is new for this assignment.
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────
 
 def filter_noise(df):
     """
@@ -322,17 +329,9 @@ def filter_noise(df):
         )
     log.info("CAT-4 non-vessel transponders removed: {:,}".format(before - df.count()))
 
-    # Filter out known coordinated vessel types
-    if "name" in df.columns:
-        df = df.filter(
-            F.col("name").isNull() |
-            (
-                ~F.upper(F.col("name")).contains("RESCUE") &
-                ~F.upper(F.col("name")).contains("PILOT") &
-                ~F.upper(F.col("name")).contains("TUG") &
-                ~F.upper(F.col("name")).rlike(r"HG \d+")
-            )
-        )
+    # NOTE: No longer filtering out tugs/rescues/pilots by name.
+    # The collision detection logic will naturally eliminate tug-assist patterns
+    # via the approach/diverge signature validation (find_collision function).
 
     # CATEGORY 5 — Stationary vessels (SOG below moving threshold)
     before = df.count()
@@ -381,11 +380,11 @@ def filter_noise(df):
     return df
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────
 # STAGE 3 — TELEPORTATION / GPS SPIKE REMOVAL
 # Same logic as detect.py → detect_teleportation_anomalies (Shadow Fleet).
 # Ported to Spark window functions for distributed execution.
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────
 
 def remove_teleportation(df):
     """
@@ -459,9 +458,9 @@ def remove_teleportation(df):
     return df
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────
 # STAGE 4 — SPATIAL-TEMPORAL BUCKETING (efficient candidate generation)
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────
 
 def generate_candidates(df):
     """
@@ -544,15 +543,31 @@ def generate_candidates(df):
     return candidates
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────
 # STAGE 5 — IDENTIFY THE COLLISION EVENT
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────
 
 def find_collision(candidates, denoised_df):
     """
     Find the closest-approach event where both vessels were genuinely
     far apart before the collision — ensuring visible diverging tracks.
-    Filters out tugs/escorts that move together the whole time.
+    
+    KEY INNOVATION: Distinguish between:
+      - TRUE COLLISION: Two vessels approach → get very close → diverge
+      - TUG ASSIST: Two vessels maintain constant formation distance for extended duration
+    
+    The collision signature is validated by comparing distances in three windows:
+      1. PRE-collision (10 min before)
+      2. Collision point (closest approach)
+      3. POST-collision (10 min after)
+    
+    For a true collision:
+      - pre_dist >> collision_dist (vessels approaching)
+      - collision_dist is minimum (closest point)
+      - post_dist >> collision_dist (vessels separating)
+    
+    For tug-assist formations:
+      - pre_dist ≈ collision_dist ≈ post_dist (constant distance maintained)
     """
     cands_pd = candidates.orderBy(F.col("dist_km").asc()).limit(200).toPandas()
     if cands_pd.empty:
@@ -563,9 +578,18 @@ def find_collision(candidates, denoised_df):
         t0     = pd.Timestamp(row["ts_a"])
         mmsi_a = int(row["mmsi_a"])
         mmsi_b = int(row["mmsi_b"])
+        
+        # EXPANDED TIME WINDOWS for better statistical analysis
+        # Pre-collision: 10 minutes before, averaging last 4 minutes of window
         t_pre     = (t0 - timedelta(minutes=TRAJ_WINDOW_MIN)).to_pydatetime()
-        t_pre_end = (t0 - timedelta(minutes=TRAJ_WINDOW_MIN - 2)).to_pydatetime()
+        t_pre_end = (t0 - timedelta(minutes=TRAJ_WINDOW_MIN - 4)).to_pydatetime()
+        
+        # Post-collision: 1 minute after, averaging next 6 minutes after that
+        t_post    = (t0 + timedelta(minutes=1)).to_pydatetime()
+        t_post_end = (t0 + timedelta(minutes=TRAJ_WINDOW_MIN - 4)).to_pydatetime()
 
+        # ── PRE-COLLISION WINDOW ──
+        # Average position of each vessel in the 4 minutes leading up to collision
         pre = (
             denoised_df
             .filter(F.col("mmsi").isin(mmsi_a, mmsi_b))
@@ -587,32 +611,111 @@ def find_collision(candidates, denoised_df):
         if pre_a.empty or pre_b.empty:
             continue
 
-        from math import radians, sin, cos, sqrt, atan2
         lat1, lon1 = pre_a.iloc[0]["lat"], pre_a.iloc[0]["lon"]
         lat2, lon2 = pre_b.iloc[0]["lat"], pre_b.iloc[0]["lon"]
-        R = 6371.0
-        dlat = radians(lat2 - lat1)
-        dlon = radians(lon2 - lon1)
-        a = sin(dlat/2)**2 + cos(radians(lat1))*cos(radians(lat2))*sin(dlon/2)**2
-        pre_dist_km = R * 2 * atan2(sqrt(a), sqrt(1-a))
+        pre_dist_km = haversine_distance(lat1, lon1, lat2, lon2)
 
-        if pre_dist_km > 1.0:
+        # ── POST-COLLISION WINDOW ──
+        # Average position of each vessel in the minutes after collision
+        post = (
+            denoised_df
+            .filter(F.col("mmsi").isin(mmsi_a, mmsi_b))
+            .filter(
+                (F.col("ts") >= F.lit(t_post).cast("timestamp")) &
+                (F.col("ts") <= F.lit(t_post_end).cast("timestamp"))
+            )
+            .groupBy("mmsi")
+            .agg(F.avg("lat").alias("lat"), F.avg("lon").alias("lon"))
+            .toPandas()
+        )
+
+        if len(post) < 2:
+            continue
+
+        post_a = post[post["mmsi"] == mmsi_a]
+        post_b = post[post["mmsi"] == mmsi_b]
+
+        if post_a.empty or post_b.empty:
+            continue
+
+        lat1p, lon1p = post_a.iloc[0]["lat"], post_a.iloc[0]["lon"]
+        lat2p, lon2p = post_b.iloc[0]["lat"], post_b.iloc[0]["lon"]
+        post_dist_km = haversine_distance(lat1p, lon1p, lat2p, lon2p)
+
+        collision_dist_km = float(row["dist_km"])
+        
+        # ── COLLISION SIGNATURE VALIDATION ──
+        # Measure the "approach" and "diverge" components of the collision signature
+        pre_to_collision_drop = pre_dist_km - collision_dist_km
+        post_from_collision_rise = post_dist_km - collision_dist_km
+        
+        # TRUE COLLISION signature:
+        # 1. Vessels were far apart before collision (> APPROACH_THRESHOLD_KM)
+        # 2. They got significantly closer (drop >= MIN_APPROACH_DROP_KM)
+        # 3. They separated afterwards (rise >= MIN_DIVERGE_RISE_KM AND post_dist >= DIVERGE_THRESHOLD_KM)
+        if (pre_dist_km > APPROACH_THRESHOLD_KM and 
+            pre_to_collision_drop >= MIN_APPROACH_DROP_KM and 
+            post_from_collision_rise >= MIN_DIVERGE_RISE_KM and
+            post_dist_km >= DIVERGE_THRESHOLD_KM):
+            
             best = row
-            log.info("Found: %s + %s, pre-dist=%.2f km, collision-dist=%.3f km",
-                     row.get("name_a", mmsi_a), row.get("name_b", mmsi_b),
-                     pre_dist_km, row["dist_km"])
+            log.info(
+                "✓ TRUE COLLISION DETECTED: %s (MMSI %s) + %s (MMSI %s)\n"
+                "  ├─ Pre-distance:    %.3f km\n"
+                "  ├─ Collision dist:  %.3f km\n"
+                "  ├─ Post-distance:   %.3f km\n"
+                "  ├─ Approach drop:   %.3f km\n"
+                "  └─ Diverge rise:    %.3f km",
+                row.get("name_a", mmsi_a), mmsi_a,
+                row.get("name_b", mmsi_b), mmsi_b,
+                pre_dist_km, 
+                collision_dist_km, 
+                post_dist_km,
+                pre_to_collision_drop,
+                post_from_collision_rise
+            )
             break
+        elif (pre_dist_km < 0.3 and collision_dist_km < 0.3 and post_dist_km < 0.3):
+            # TUG-ASSIST or close formation pattern detected
+            log.debug(
+                "✗ TUG-ASSIST/FORMATION PATTERN (constant distance): %s (MMSI %s) + %s (MMSI %s)\n"
+                "  All distances < 0.3 km (pre: %.3f, collision: %.3f, post: %.3f)",
+                row.get("name_a", mmsi_a), mmsi_a,
+                row.get("name_b", mmsi_b), mmsi_b,
+                pre_dist_km, 
+                collision_dist_km, 
+                post_dist_km
+            )
+            continue
+        else:
+            # Partial signature match (not enough approach/diverge)
+            log.debug(
+                "✗ REJECTED (weak signature): %s (MMSI %s) + %s (MMSI %s)\n"
+                "  Pre: %.3f km, Collision: %.3f km, Post: %.3f km | "
+                "Drop: %.3f km (need ≥%.3f), Rise: %.3f km (need ≥%.3f)",
+                row.get("name_a", mmsi_a), mmsi_a,
+                row.get("name_b", mmsi_b), mmsi_b,
+                pre_dist_km,
+                collision_dist_km,
+                post_dist_km,
+                pre_to_collision_drop, MIN_APPROACH_DROP_KM,
+                post_from_collision_rise, MIN_DIVERGE_RISE_KM
+            )
+            continue
 
     if best is None:
-        log.warning("No approach/diverge pair found, falling back to minimum distance.")
+        log.warning(
+            "No true approach/diverge collision signature found. "
+            "Falling back to minimum distance (may be tug-assist or close encounter)."
+        )
         best = cands_pd.iloc[0]
 
     return best
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────
 # STAGE 6 — TRAJECTORY EXTRACTION
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────
 
 def extract_trajectories(df, event) -> pd.DataFrame:
     """
@@ -638,9 +741,9 @@ def extract_trajectories(df, event) -> pd.DataFrame:
     return traj
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────
 # STAGE 7 — VISUALISATION
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────
 
 def plot_trajectories(traj: pd.DataFrame, event) -> str:
     """
@@ -726,9 +829,9 @@ def plot_trajectories(traj: pd.DataFrame, event) -> str:
     return out
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────
 # STAGE 8 — PRINT RESULTS
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────
 
 def print_results(event) -> None:
     dist_m = float(event["dist_km"]) * 1000
@@ -747,9 +850,9 @@ def print_results(event) -> None:
     print(sep + "\n")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────
 # MAIN
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────
 
 def main():
     spark = build_spark()
