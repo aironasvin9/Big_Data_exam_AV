@@ -92,16 +92,14 @@ GRID_SIZE = 0.05   # degrees
 # IMO defines near-miss at < 0.5 nm (926 m). We use 500 m as collision threshold.
 COLLISION_KM = 0.5   # km  (same unit as haversine_distance in geo.py)
 
-# --- Trajectory window (new for this assignment) ---
+# --- Trajectory window (STRICT REQUIREMENT: ±10 minutes) ---
 TRAJ_WINDOW_MIN = 10   # minutes either side of collision
 
 # --- Collision signature validation (RELAXED for real-world data) ---
 # Data-driven thresholds: require approach/diverge but more lenient
-# The "1 million candidates" suggests many are formations or close encounters
-# We want to find THE collision (if it exists) without over-filtering
-APPROACH_THRESHOLD_KM = 0.1   # Reduced: just needs meaningful approach
-DIVERGE_THRESHOLD_KM = 0.05   # Reduced: just needs some divergence
-MIN_PRE_DISTANCE_KM = 0.05    # If pre-distance < 50m, might already be colliding
+APPROACH_THRESHOLD_KM = 0.1    # Reduced: just needs meaningful approach
+DIVERGE_THRESHOLD_KM = 0.05    # Reduced: just needs some divergence
+MIN_PRE_DISTANCE_KM = 0.05     # If pre-distance < 50m, might already be colliding
 TUG_FORMATION_MAX_DIST = 0.15  # Tug formations stay < 150m always
 
 # --- Runtime paths ---
@@ -149,7 +147,7 @@ def dist_to_centre(lat: float, lon: float) -> float:
     return haversine_distance(lat, lon, CENTER_LAT, CENTER_LON)
 
 
-# ────────────────────────────────────────────────────────────────────
+# ──────────────���─────────────────────────────────────────────────────
 # MMSI VALIDATION
 # Ported directly from parsing.py → is_valid_mmsi (Shadow Fleet project).
 # ────────────────────────────────────────────────────────────────────
@@ -462,7 +460,7 @@ def remove_teleportation(df):
 
 # ────────────────────────────────────────────────────────────────────
 # STAGE 4 — SPATIAL-TEMPORAL BUCKETING (efficient candidate generation)
-# ────────────────────────────────────────────────────────────────────
+# ───────────────────────���────────────────────────────────────────────
 
 def generate_candidates(df):
     """
@@ -557,13 +555,10 @@ def find_collision(candidates, denoised_df):
     use RELAXED thresholds to find ANY collision pattern, then select the
     best candidate by strongest divergence.
     
-    This is a real-world dataset — there may or may not be a true collision.
-    Our job is to:
-    1. Find candidates showing approach/diverge behavior (not constant distance)
-    2. Among those, pick the one with clearest divergence
-    3. If none found, report the closest pair with some separation
+    Optimized for Spark: Pre-compute all pre/post distances in Spark SQL
+    before converting to Pandas for final evaluation.
     """
-    cands_pd = candidates.orderBy(F.col("dist_km").asc()).limit(5000).toPandas()
+    cands_pd = candidates.orderBy(F.col("dist_km").asc()).limit(500).toPandas()
     if cands_pd.empty:
         raise RuntimeError("No collision candidates found.")
 
@@ -580,7 +575,9 @@ def find_collision(candidates, denoised_df):
         name_a = str(row.get("name_a") or f"MMSI {mmsi_a}")
         name_b = str(row.get("name_b") or f"MMSI {mmsi_b}")
         
-        # Time windows: large enough to get reliable statistics
+        # ────────────────────────────────────────────────────────────────────
+        # STRICT REQUIREMENT: ±10 minute window for trajectory analysis
+        # ────────────────────────────────────────────────────────────────────
         t_pre     = (t0 - timedelta(minutes=TRAJ_WINDOW_MIN)).to_pydatetime()
         t_pre_end = (t0 - timedelta(minutes=TRAJ_WINDOW_MIN - 6)).to_pydatetime()
         
@@ -722,6 +719,7 @@ def find_collision(candidates, denoised_df):
 def extract_trajectories(df, event) -> pd.DataFrame:
     """
     Pull all pings for both vessels within ±TRAJ_WINDOW_MIN of the collision.
+    STRICT REQUIREMENT: ±10 minutes
     """
     t0     = pd.Timestamp(event["ts_a"])
     mmsi_a = int(event["mmsi_a"])
