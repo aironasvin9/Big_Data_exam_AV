@@ -1,14 +1,25 @@
-version: "3.9"
-
 # ============================================================
 # AIS Collision Detection — Docker Compose
 # ============================================================
+#
 # Volumes:
-#   ./data   → /app/data    (AIS CSV files, downloaded automatically)
-#   ./output → /app/output  (results: trajectory_map.png, etc.)
+#   ./data   → /app/data    AIS CSV input files
+#   ./output → /app/output  generated outputs, including trajectory_map.png
 #
 # Usage:
-#   docker compose up --build
+#   1. Place extracted December 2021 AIS CSV files in ./data
+#      Expected files:
+#        ./data/aisdk-2021-12-01.csv
+#        ...
+#        ./data/aisdk-2021-12-31.csv
+#
+#   2. Build and run:
+#        docker compose up --build
+#
+# Notes:
+#   - This is a batch job; no ports are exposed.
+#   - The data directory is mounted read-only because the pipeline only reads it.
+#   - Output files are written to ./output on the host.
 # ============================================================
 
 services:
@@ -16,18 +27,31 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+
     image: ais-collision-detection:latest
     container_name: ais-collision-detection
+
     environment:
-      - DATA_DIR=/app/data
-      - OUTPUT_DIR=/app/output
-      # Tune Spark memory to fit your host — adjust if needed
-      - SPARK_DRIVER_MEMORY=4g
+      DATA_DIR: /app/data
+      OUTPUT_DIR: /app/output
+
+      # Optional runtime tuning.
+      # These defaults match src/collision_detection.py.
+      USE_SHIFTED_SPATIAL_BLOCKING: "0"
+      CANDIDATE_PAIR_LIMIT: "5000"
+      EXCLUDE_PASSENGER_HSC_PAIRS: "1"
+      REQUIRE_POST_IMPACT_ANOMALY: "1"
+
+      # Uncomment only if src/collision_detection.py reads this variable
+      # in SparkSession.builder.config("spark.driver.memory", ...).
+      # SPARK_DRIVER_MEMORY: "8g"
+
     volumes:
-      # Persist downloaded CSV files between runs
-      - ./data:/app/data
-      # Collect the output (trajectory_map.png + any logs)
+      # Input AIS CSV files.
+      - ./data:/app/data:ro
+
+      # Generated outputs, e.g. trajectory_map.png.
       - ./output:/app/output
-    # Give Spark enough shared memory for in-process shuffle
+
+    # Useful for Spark/Python workloads with larger in-process operations.
     shm_size: "2gb"
-    # No ports needed — this is a batch job
