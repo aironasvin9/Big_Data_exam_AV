@@ -3,12 +3,11 @@
 # ============================================================
 #
 # Base image:
-#   python:3.11-slim
+#   python:3.11-slim-bookworm
 #
-# Includes:
-#   - Java 17 runtime required by PySpark
-#   - Python dependencies from requirements.txt
-#   - Application source code from ./src
+# Why bookworm?
+#   Debian trixie no longer provides openjdk-17-jre-headless.
+#   PySpark 3.5.x is safest with Java 17, so we pin to bookworm.
 #
 # Runtime expectation:
 #   - AIS CSV files are mounted/provided in /app/data
@@ -20,7 +19,7 @@
 #
 # ============================================================
 
-FROM python:3.11-slim
+FROM python:3.11-slim-bookworm
 
 # ─────────────────────────────────────────────────────────────
 # Environment
@@ -31,10 +30,6 @@ ENV PYSPARK_PYTHON=python3
 
 ENV DATA_DIR=/app/data
 ENV OUTPUT_DIR=/app/output
-
-# Java home required by PySpark.
-ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
-ENV PATH="${JAVA_HOME}/bin:${PATH}"
 
 # By default, do not download data inside the container.
 # The normal workflow is to mount extracted CSV files into /app/data.
@@ -50,6 +45,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         curl \
         wget \
     && rm -rf /var/lib/apt/lists/*
+
+# Configure JAVA_HOME robustly across CPU architectures.
+# On arm64 and amd64 the Java path differs, so derive it from `which java`.
+RUN JAVA_HOME_REAL="$(dirname "$(dirname "$(readlink -f "$(which java)")")")" \
+    && ln -s "${JAVA_HOME_REAL}" /usr/local/openjdk-17
+
+ENV JAVA_HOME=/usr/local/openjdk-17
+ENV PATH="${JAVA_HOME}/bin:${PATH}"
 
 # ─────────────────────────────────────────────────────────────
 # Working directory
