@@ -10,17 +10,18 @@
 
 1. [Overview](#overview)
 2. [Quick Start](#quick-start)
-3. [Repository Structure](#repository-structure)
-4. [Methodology](#methodology)
-5. [Data Quality & Noise Handling](#data-quality--noise-handling)
-6. [Computational Strategy](#computational-strategy)
-7. [Candidate Validation](#candidate-validation)
-8. [Results](#results)
-9. [Docker Hub & Image Export](#docker-hub--image-export)
-10. [Configuration Reference](#configuration-reference)
-11. [Dependencies](#dependencies)
-12. [Limitations](#limitations)
-13. [Data Source](#data-source)
+3. [Important Path Notes](#important-path-notes)
+4. [Repository Structure](#repository-structure)
+5. [Methodology](#methodology)
+6. [Data Quality & Noise Handling](#data-quality--noise-handling)
+7. [Computational Strategy](#computational-strategy)
+8. [Candidate Validation](#candidate-validation)
+9. [Results](#results)
+10. [Docker Image Submission](#docker-image-submission)
+11. [Configuration Reference](#configuration-reference)
+12. [Dependencies](#dependencies)
+13. [Limitations](#limitations)
+14. [Data Source](#data-source)
 
 ---
 
@@ -72,13 +73,15 @@ data/aisdk-2021-12-02.csv
 data/aisdk-2021-12-31.csv
 ```
 
+The Docker image does **not** contain the raw AIS data. The data must be provided by mounting the local `data/` directory into the container.
+
 ---
 
 ### Option A — Docker Compose
 
 ```bash
-git clone https://github.com/<your-username>/ais-collision-detection.git
-cd ais-collision-detection
+git clone https://github.com/aironasvin9/Big_Data_exam_AV.git
+cd Big_Data_exam_AV
 
 mkdir -p data output
 
@@ -95,11 +98,17 @@ stdout with selected MMSI pair, vessel names, timestamp, coordinates, and valida
 
 ---
 
-### Option B — Docker run
+### Option B — Docker Run
+
+Build the image:
 
 ```bash
 docker build -t ais-collision-detection:latest .
+```
 
+Run the container:
+
+```bash
 mkdir -p data output
 
 docker run --rm \
@@ -110,11 +119,26 @@ docker run --rm \
   ais-collision-detection:latest
 ```
 
+This mounts:
+
+```text
+host ./data   → container /app/data
+host ./output → container /app/output
+```
+
+The output map will be written to:
+
+```text
+output/trajectory_map.png
+```
+
 ---
 
-### Option C — Local Python run
+### Option C — Local Python Run
 
-If running outside Docker:
+If running outside Docker, use local host paths.
+
+From the project root:
 
 ```bash
 python -m venv venv311
@@ -122,15 +146,73 @@ source venv311/bin/activate
 
 pip install -r requirements.txt
 
-DATA_DIR=./data OUTPUT_DIR=./output python src/collision_detection.py
+export DATA_DIR="$(pwd)/data"
+export OUTPUT_DIR="$(pwd)/output"
+
+python src/collision_detection.py
 ```
+
+On macOS with Homebrew Java, you may also need:
+
+```bash
+export JAVA_HOME="/opt/homebrew/opt/openjdk@17"
+export PATH="$$JAVA_HOME/bin:$$PATH"
+```
+
+Do **not** use `/app/data` for local execution unless that directory actually exists on your host. `/app/data` is the container path used inside Docker.
+
+---
+
+## Important Path Notes
+
+The code reads paths from environment variables:
+
+```python
+DATA_DIR = os.getenv("DATA_DIR", "/app/data")
+OUTPUT_DIR = os.getenv("OUTPUT_DIR", "/app/output")
+```
+
+This is intentional.
+
+### Docker paths
+
+Inside the Docker container, the correct paths are:
+
+```text
+DATA_DIR=/app/data
+OUTPUT_DIR=/app/output
+```
+
+The local `data/` and `output/` directories are mounted into those container paths using Docker volume mounts:
+
+```bash
+-v "$(pwd)/data:/app/data:ro"
+-v "$(pwd)/output:/app/output"
+```
+
+### Local paths
+
+When running directly on a local machine outside Docker, use:
+
+```bash
+export DATA_DIR="$(pwd)/data"
+export OUTPUT_DIR="$(pwd)/output"
+```
+
+For example, on the author's local machine this was equivalent to a full path such as:
+
+```text
+/Users/.../Big_Data_exam_AV/data
+```
+
+However, such absolute user-specific paths are **not hard-coded** in the repository and are not required for Docker execution.
 
 ---
 
 ## Repository Structure
 
 ```text
-ais-collision-detection/
+Big_Data_exam_AV/
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
@@ -143,13 +225,7 @@ ais-collision-detection/
     └── trajectory_map.png
 ```
 
-If the repository includes an optional downloader script, it may also contain:
-
-```text
-src/download_data.py
-```
-
-However, the main pipeline assumes the December CSV files are already present in `DATA_DIR`.
+The main pipeline assumes the December CSV files are already present in `DATA_DIR`.
 
 ---
 
@@ -621,6 +697,41 @@ If final artifacts are copied after execution, they may also appear as:
 output/final/trajectory_map_final.png
 output/final/final_run.log
 output/final/final_result.md
+```
+
+---
+
+## Docker Image Submission
+
+The repository includes a valid Dockerfile and docker-compose.yml.
+
+A Docker image can be built with:
+
+```bash
+docker build -t ais-collision-detection:latest .
+```
+
+A Docker image can be exported with:
+
+```bash
+docker save ais-collision-detection:latest -o ais-collision-detection.tar
+```
+
+The exported image can be loaded with:
+
+```bash
+docker load -i ais-collision-detection.tar
+```
+
+Then run with:
+
+```bash
+docker run --rm \
+  -e DATA_DIR=/app/data \
+  -e OUTPUT_DIR=/app/output \
+  -v "$(pwd)/data:/app/data:ro" \
+  -v "$(pwd)/output:/app/output" \
+  ais-collision-detection:latest
 ```
 
 ---
