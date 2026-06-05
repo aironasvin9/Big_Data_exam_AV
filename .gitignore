@@ -31,3 +31,5 @@ env/
 
 # Docker
 *.tar
+.DS_Store
+venv311/
